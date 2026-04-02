@@ -48,15 +48,16 @@ read_state() {
 write_state() {
   local key="$1"
   local val="$2"
+  local tmp="${STATE_FILE}.tmp"
   if [ -f "$STATE_FILE" ]; then
     python3 -c "
 import json
 with open('$STATE_FILE','r') as f: d=json.load(f)
 d['$key']='$val'
-with open('$STATE_FILE','w') as f: json.dump(d,f)
-" 2>/dev/null
+with open('${tmp}','w') as f: json.dump(d,f)
+" 2>/dev/null && mv "$tmp" "$STATE_FILE"
   else
-    echo "{\"$key\":\"$val\"}" > "$STATE_FILE"
+    echo "{\"$key\":\"$val\"}" > "$tmp" && mv "$tmp" "$STATE_FILE"
   fi
 }
 
@@ -87,7 +88,12 @@ send_alert() {
       -d "{\"channel\":\"whatsapp\",\"to\":\"${WA_ALERT_TARGET}\",\"message\":\"${msg}\"}" 2>/dev/null && return 0
   fi
   
-  log "ALERT DELIVERY FAILED — no working alert channel"
+  # Fallback: macOS notification (always works, even if gateway is dead)
+  if command -v osascript &>/dev/null; then
+    osascript -e "display notification \"$msg\" with title \"🚨 OpenClaw Watchdog\"" 2>/dev/null
+  fi
+  
+  log "ALERT DELIVERY: WA failed, macOS notification sent as fallback"
   return 1
 }
 
@@ -169,8 +175,24 @@ while true; do
       sleep 5
       
       if check_gateway_process; then
-        send_alert "🔄 OpenClaw gateway was down — auto-restarted successfully"
-        log "Gateway restarted successfully"
+        # Process is back — verify health endpoint with retries
+        _healthy=false
+        for _i in 1 2 3; do
+          sleep 3
+          if check_gateway_health; then
+            _healthy=true
+            break
+          fi
+          log "Health check retry $_i/3 after restart..."
+        done
+        
+        if $_healthy; then
+          send_alert "🔄 OpenClaw gateway was down — auto-restarted and healthy"
+          log "Gateway restarted and healthy"
+        else
+          send_alert "⚠️ OpenClaw gateway restarted but health check failing — may need attention"
+          log "Gateway restarted but NOT healthy"
+        fi
       else
         send_alert "🚨 OpenClaw gateway is DOWN and failed to restart! Manual intervention needed."
         log "Gateway restart FAILED"
